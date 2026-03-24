@@ -390,236 +390,223 @@ class Rebates():
 
         return aportes
 
-    def proceso(self, vna1 = None, vna2 = None, remu = None, aportes = None):
-        # comprobamos los archivos
+    def proceso(self, vna1=None, vna2=None, remu=None, aportes=None):
         self.comprobar_ruta(vna1, vna2, remu, aportes)
 
-        # cargamos vna
-        d_vna = self.cargar_vna(vna1, vna2)
-
-        # cargamos remuneraciones
-        d_remu = self.cargar_remu(remu)
-
-        # cargamos aportes
+        d_vna     = self.cargar_vna(vna1, vna2)
+        d_remu    = self.cargar_remu(remu)
         d_aportes = self.carga_aportes(aportes)
 
-        # Generamos el entregable
-        entre = pd.DataFrame(columns = ['Fecha', 'Cod.Realais', 'RUN', 'Nombre Fondo', 'MonedaFondo', 'Serie', 'Rut Aportante', 'DV', 'Nombre Aportante', 'Cuenta', 'SaldoCuotasInicial', 'AportesTipo1', 'SaldoCuotas', 'Remuneración', 'Patrimonio Afecto', 'Aplica IVA', 'Neto', 'Exento', 'IVA', 'TOTAL', 'Tipo Series'])
+        # Convertir a float para operaciones vectorizadas
+        d_vna["SaldoCuotas"]        = d_vna["SaldoCuotas"].apply(float)
+        d_remu["Remuneracion"]      = d_remu["Remuneracion"].apply(float)
+        d_remu["Patrimonio_Afecto"] = d_remu["Patrimonio_Afecto"].apply(float)
+        d_aportes["Cuotas"]         = d_aportes["Cuotas"].apply(float)
 
-        entre["SaldoCuotasInicial"] = d_vna["SaldoCuotas"].apply(Decimal)
-        entre["Fecha"] = d_vna["FechaProceso"]
-        entre["Nombre Fondo"] = d_vna["NombreFondoMadre"]
-        entre["MonedaFondo"] = d_vna["MonedaFondo"]
-        entre["Serie"] = [x.strip() for x in d_vna["CodigoSerie"]]
-        entre["Rut Aportante"] = d_vna["a_Rut"]
-        entre["DV"] = d_vna["a_DV"]
-        entre["Nombre Aportante"] = d_vna["NombreParticipe"]
-        entre["Cuenta"] = d_vna["Cuenta"]
+        # --- Tabla base desde VNA ---
+        run_map = dict(zip(self.homo2["Codigo"], self.homo2["RUN"]))
 
-        # agregamos Cod.Realais y RUN, con las tablas de homologacion
-        for x in entre["Serie"].unique().tolist():
-            x1 = f"F{x.split('-')[0]}"
-            try:
-                entre.loc[entre["Serie"] == x, "Cod.Realais"] = x1
-            except:
-                print(x)
+        entre = pd.DataFrame({
+            "Fecha":             d_vna["FechaProceso"].values,
+            "Cod.Realais":       ["F" + x.split("-")[0] for x in d_vna["CodigoSerie"].str.strip()],
+            "RUN":               "",
+            "Nombre Fondo":      d_vna["NombreFondoMadre"].values,
+            "MonedaFondo":       d_vna["MonedaFondo"].values,
+            "Serie":             d_vna["CodigoSerie"].str.strip().values,
+            "Rut Aportante":     d_vna["a_Rut"].values,
+            "DV":                d_vna["a_DV"].values,
+            "Nombre Aportante":  d_vna["NombreParticipe"].values,
+            "Cuenta":            d_vna["Cuenta"].values,
+            "SaldoCuotasInicial": d_vna["SaldoCuotas"].values,
+            "AportesTipo1":      0.0,
+        })
+        entre["RUN"] = entre["Cod.Realais"].map(run_map)
 
-        for x in entre["Cod.Realais"].unique().tolist():
-            try:
-                entre.loc[entre["Cod.Realais"] == x, "RUN"] = self.homo2.loc[self.homo2["Codigo"] == x, "RUN"].iloc[0]
-            except:
-                print(x)
+        # Clave de cruce con aportes
+        entre["a_cruce"] = (
+            entre["Rut Aportante"].astype(str).apply(lambda x: str(int(x)))
+            + entre["Serie"].str.strip()
+            + entre["Cuenta"].astype(str)
+            + entre["Fecha"].apply(lambda x: str(self.ffechas(x)))
+        )
 
-        # agregamos el ID para cruzar los aportes
-        entre["a_cruce"] = [str(int(a)) + str(b).strip() + str(c) + str(self.ffechas(d)) for a, b, c, d in zip(entre["Rut Aportante"], entre["Serie"], entre["Cuenta"], entre["Fecha"])]
-        entre = entre.reset_index(drop = True)
+        # --- Match aportes (vectorizado) ---
+        aportes_sum = d_aportes.groupby("a_cruce")["Cuotas"].sum()
+        entre["AportesTipo1"] = entre["a_cruce"].map(aportes_sum).fillna(0.0)
 
-        for i, x in enumerate(entre["a_cruce"]):
-            try:
-                entre.loc[i, "AportesTipo1"] = d_aportes.loc[d_aportes["a_cruce"] == x, "Cuotas"].apply(Decimal).sum()
-            except:
-                entre.loc[i, "AportesTipo1"] = "0"
+        # --- Filas de aportes sin match en VNA ---
+        f_aportes = d_aportes[~d_aportes["a_cruce"].isin(set(entre["a_cruce"]))].copy()
+        if len(f_aportes) > 0:
+            fg = f_aportes.groupby("a_cruce").agg(
+                Fecha            =("Fecha",             "first"),
+                Nombre_Fondo     =("Nombre_Fondo_Madre","first"),
+                MonedaFondo      =("Moneda",            "first"),
+                Serie            =("Fondo",             "first"),
+                Rut_Aportante    =("Rut_Participe",     "first"),
+                DV               =("Dv",                "first"),
+                Nombre_Aportante =("Nombre_Partici",    "first"),
+                Cuenta           =("Cuenta",            "first"),
+                Cuotas           =("Cuotas",            "sum"),
+                Cod_Realais      =("Fondo_Madre",       "first"),
+            ).reset_index()
+            extra = pd.DataFrame({
+                "Fecha":             fg["Fecha"].values,
+                "Cod.Realais":       fg["Cod_Realais"].values,
+                "RUN":               fg["Cod_Realais"].map(run_map).values,
+                "Nombre Fondo":      fg["Nombre_Fondo"].values,
+                "MonedaFondo":       fg["MonedaFondo"].values,
+                "Serie":             fg["Serie"].str.strip().values,
+                "Rut Aportante":     fg["Rut_Aportante"].apply(lambda x: str(int(float(x)))).values,
+                "DV":                fg["DV"].values,
+                "Nombre Aportante":  fg["Nombre_Aportante"].values,
+                "Cuenta":            fg["Cuenta"].values,
+                "SaldoCuotasInicial": 0.0,
+                "AportesTipo1":      fg["Cuotas"].values,
+                "a_cruce":           fg["a_cruce"].values,
+            })
+            entre = pd.concat([entre, extra], ignore_index=True)
 
-        f_aportes = d_aportes.loc[[i for i, x in enumerate(d_aportes["a_cruce"]) if not x in entre["a_cruce"].tolist()],].reset_index(drop = True)
+        dif_a = entre["AportesTipo1"].sum() - d_aportes["Cuotas"].sum()
+        print("Monto de aportes coincide" if abs(dif_a) < 0.01
+              else f"Monto de aportes no coincide por {dif_a:.4f}")
 
-        # agregamos los aportes faltantes al entregable
-        for i in range(0, len(f_aportes)):
-            j = len(entre)
-            entre.loc[j, "Fecha"] = f_aportes.loc[i, "Fecha"] #
-            entre.loc[j, "Nombre Fondo"] = f_aportes.loc[i, "Nombre_Fondo_Madre"]#
-            entre.loc[j, "MonedaFondo"] = f_aportes.loc[i, "Moneda"] #
-            entre.loc[j, "Serie"] = f_aportes.loc[i, "Fondo"].strip() #
-            entre.loc[j, "Rut Aportante"] = str(int(f_aportes.loc[i, "Rut_Participe"])) #
-            entre.loc[j, "DV"] = f_aportes.loc[i, "Dv"] #
-            entre.loc[j, "Nombre Aportante"] = f_aportes.loc[i, "Nombre_Partici"]
-            entre.loc[j, "Cuenta"] = f_aportes.loc[i, "Cuenta"] #
-            entre.loc[j, "AportesTipo1"] = f_aportes.loc[i, "Cuotas"]
-            entre.loc[j, "SaldoCuotasInicial"] = Decimal("0") #
-
-            # agregamos Cod.Realais y RUN, con las tablas de homologacion
-            try:
-                # Cod.Realais
-                entre.loc[j, "Cod.Realais"] = f_aportes.loc[i, "Fondo_Madre"]
-                # RUN
-                entre.loc[j, "RUN"] = self.homo2.loc[self.homo2["Codigo"] == entre.loc[j, "Cod.Realais"], "RUN"].iloc[0]
-            except:
-                print(f"No se encontro {entre.loc[j, 'Nombre Fondo']}")
-
-        # cambiamos de formato a las columnas de cuotas y aportes
-        entre["SaldoCuotasInicial"] = entre["SaldoCuotasInicial"].apply(Decimal)
-        entre["AportesTipo1"] = entre["AportesTipo1"].apply(Decimal)
-
-        # ordenamos las data por fecha y serie
-        entre = entre.sort_values(["Fecha", "Serie"], ascending = [True, True]).reset_index(drop = True)
-
-        # sumamos los cuotas con los aportes
+        entre = entre.sort_values(["Fecha", "Serie"]).reset_index(drop=True)
         entre["SaldoCuotas"] = entre["SaldoCuotasInicial"] + entre["AportesTipo1"]
 
-        # creamos ID para distribuir la remuneracion y el patrimonio
-        entre["a_remu"] = [str(a).strip()+str(self.ffechas(b)) for a, b in zip(entre["Serie"], entre["Fecha"])]
+        # --- Distribucion de remuneracion y patrimonio (vectorizado) ---
+        entre["a_remu"] = (
+            entre["Serie"].str.strip()
+            + entre["Fecha"].apply(lambda x: str(self.ffechas(x)))
+        )
 
-        for i, x in enumerate(entre["a_remu"]):
-            t_remu = d_remu.loc[d_remu["a_remu"] == x, "Remuneracion"].sum()
-            t_patri = d_remu.loc[d_remu["a_remu"] == x, "Patrimonio_Afecto"].sum()
-            t_cuota = entre.loc[entre["a_remu"] == x, "SaldoCuotas"].sum()
+        remu_tot  = d_remu.groupby("a_remu")[["Remuneracion","Patrimonio_Afecto"]].sum().rename(
+            columns={"Remuneracion":"t_remu","Patrimonio_Afecto":"t_patri"}).reset_index()
+        cuota_tot = entre.groupby("a_remu")["SaldoCuotas"].sum().rename("t_cuota").reset_index()
 
-            cuotas = entre.loc[i, "SaldoCuotas"]
+        entre = entre.merge(remu_tot,  on="a_remu", how="left")
+        entre = entre.merge(cuota_tot, on="a_remu", how="left")
+        entre[["t_remu","t_patri","t_cuota"]] = entre[["t_remu","t_patri","t_cuota"]].fillna(0.0)
 
-            if t_cuota != 0:
-                entre.loc[i, "Remuneración"] = (cuotas/t_cuota)*t_remu
-                entre.loc[i, "Patrimonio Afecto"] = (cuotas/t_cuota)*t_patri
-            else:
-                entre.loc[i, "Remuneración"] = Decimal("0")
-                entre.loc[i, "Patrimonio Afecto"] = Decimal("0")
+        mask_cuota = entre["t_cuota"] != 0.0
+        entre["Remuneración"]     = 0.0
+        entre["Patrimonio Afecto"] = 0.0
+        entre.loc[mask_cuota, "Remuneración"]      = (
+            entre.loc[mask_cuota, "SaldoCuotas"] / entre.loc[mask_cuota, "t_cuota"]
+            * entre.loc[mask_cuota, "t_remu"]
+        )
+        entre.loc[mask_cuota, "Patrimonio Afecto"] = (
+            entre.loc[mask_cuota, "SaldoCuotas"] / entre.loc[mask_cuota, "t_cuota"]
+            * entre.loc[mask_cuota, "t_patri"]
+        )
+        entre = entre.drop(columns=["t_remu","t_patri","t_cuota"])
 
-        ### COMPROBAMOS LAS DISTRIBUCIONES ###
-        if entre["AportesTipo1"].sum() == d_aportes["Cuotas"].sum():
-            print("Monto de aportes coincide")
-        else:
-            dif = entre["AportesTipo1"].sum() - d_aportes["Cuotas"].sum()
-            print(f"Monto de aportes no coincide por {dif}")
+        dif_r = entre["Remuneración"].sum() - d_remu["Remuneracion"].sum()
+        dif_p = entre["Patrimonio Afecto"].sum() - d_remu["Patrimonio_Afecto"].sum()
+        print("Monto de remuneraciones coincide" if abs(dif_r) < 0.01
+              else f"Monto de remuneraciones NO coincide por {dif_r:.4f}")
+        print("Monto de Patrimonio coincide" if abs(dif_p) < 0.01
+              else f"Monto de Patrimonio NO coincide por {dif_p:.4f}")
 
-        if entre["Remuneración"].sum() == d_remu["Remuneracion"].sum():
-            print("Monto de remuneraciones coincide")
-        else:
-            dif = entre["Remuneración"].sum() - d_remu["Remuneracion"].sum()
-            print(f"Monto de remuneraciones NO coincide por {dif}")
+        # --- IVA / Neto / Exento (vectorizado) ---
+        iva_map = dict(zip(self.homo1["Fondo-Serie"], self.homo1["IVA"]))
+        entre["Aplica IVA"] = entre["Serie"].map(iva_map)
 
+        mask_s = entre["Aplica IVA"] == "S"
+        mask_n = entre["Aplica IVA"] == "N"
 
-        if entre["Patrimonio Afecto"].sum() == d_remu["Patrimonio_Afecto"].sum():
-            print("Monto de Patrimonio coincide")
-        else:
-            dif = entre["Patrimonio Afecto"].sum() - d_remu["Patrimonio_Afecto"].sum()
-            print(f"Monto de Patrimonio NO coincide por {dif}")
-
-        # Agregamos si aplica IVA
-        for x in entre["Serie"].unique().tolist():
-            try:
-                entre.loc[entre["Serie"] == x, "Aplica IVA"] = self.homo1.loc[self.homo1["Fondo-Serie"] == x, "IVA"].iloc[0]
-            except:
-                print(x)
-
-        # asignamos a las columnas Neto Exento IVA y Total el formato Decimal
-        entre["Neto"] = Decimal("0")
-        entre["Exento"] = Decimal("0")
-        entre["IVA"] = Decimal("0")
-        entre["TOTAL"] = Decimal("0")
-
-        # Calculamos el Neto
-        for i, x in enumerate(entre["Aplica IVA"]):
-            if x == "S":
-                entre.loc[i, "Neto"] = Decimal(str(entre.loc[i, "Remuneración"])) / Decimal("1.19")
-            else:
-                entre.loc[i, "Neto"] = Decimal("0")
-
-        # Calculamos el exento
-        for i, x in enumerate(entre["Aplica IVA"]):
-            if x == "S":
-                entre.loc[i, "Exento"] = Decimal("0")
-            elif x == "N":
-                entre.loc[i, "Exento"] = entre.loc[i, "Remuneración"]
-
-        # agregamos el total
+        entre["Neto"]   = 0.0
+        entre["Exento"] = 0.0
+        entre.loc[mask_s, "Neto"]   = entre.loc[mask_s, "Remuneración"] / 1.19
+        entre.loc[mask_n, "Exento"] = entre.loc[mask_n, "Remuneración"]
         entre["TOTAL"] = entre["Remuneración"]
+        entre["IVA"]   = 0.0
+        entre.loc[mask_s, "IVA"] = entre.loc[mask_s, "TOTAL"] - entre.loc[mask_s, "Neto"]
 
-        # Agregamos el monto del IVA
-        for i in range(0, len(entre)):
-            if entre.loc[i, "Neto"] != Decimal("0"):
-                entre.loc[i, "IVA"] = entre.loc[i, "TOTAL"] - entre.loc[i, "Neto"]
-            else:
-                entre.loc[i, "IVA"] = Decimal("0")
-
-        ### COMPROBAMOS QUE EL IVA SE HAYA DISTRIBUIDO CORRECTAMENTE ###
         t_sum = entre["Neto"].sum() + entre["Exento"].sum() + entre["IVA"].sum()
+        dif_iva = entre["Remuneración"].sum() - t_sum
+        print("Neto+Exento+IVA coincide" if abs(dif_iva) < 0.01
+              else f"Neto+Exento+IVA NO coincide por {dif_iva:.4f}")
 
-        if entre["Remuneración"].sum() == t_sum:
-            print("Monto de remuneracion coincide con neto, exento e IVA")
-        else:
-            dif = entre["Remuneración"].sum() - t_sum
-            print(f"Monto de remuneracion coincide con neto, exento e IVA NO coincide por {dif}")
+        entre["Tipo Series"] = np.where(mask_s, "No APV", "APV")
 
-        # Identificamos si son series APV o NO-APV
-        entre["Tipo Series"] = ["No APV" if x == "S" else "APV" for x in entre["Aplica IVA"]]
+        # --- Consolidar duplicados (entre_v2) ---
+        entre["id"] = (
+            entre["Fecha"].apply(lambda x: str(self.ffechas(x)))
+            + entre["Serie"]
+            + entre["Rut Aportante"].astype(str)
+        )
 
-        ### ENTREGABLE V2 ###
-        entre["id"] = [str(self.ffechas(a)) + str(b) + str(c) for a, b, c in zip(entre["Fecha"], entre["Serie"], entre["Rut Aportante"])]
+        num_cols = ["SaldoCuotasInicial","AportesTipo1","SaldoCuotas",
+                    "Patrimonio Afecto","Remuneración","Neto","Exento","IVA","TOTAL"]
+        str_cols = ["Fecha","Cod.Realais","RUN","Nombre Fondo","MonedaFondo",
+                    "Serie","Rut Aportante","DV","Nombre Aportante","Tipo Series"]
 
-        # creamos un nuevo dataframe para dejar solo una observacion diaria por cliente
-        entre_v2 = pd.DataFrame(columns = ['Fecha', 'Cod.Realais', 'RUN', 'Nombre Fondo', 'MonedaFondo', 'Serie', 'Rut Aportante', 'DV', 'Nombre Aportante', 'Tipo Series', 'SaldoCuotasInicial', 'AportesTipo1', 'SaldoCuotas', 'Patrimonio Afecto', 'Remuneración', 'Neto', 'Exento', 'IVA', 'TOTAL'])
+        entre_v2 = entre.groupby("id", sort=False).agg(
+            **{c: (c, "sum")   for c in num_cols},
+            **{c: (c, "first") for c in str_cols},
+        ).reset_index(drop=True)
 
-
-        for x in entre["id"].unique().tolist():
-            j = len(entre_v2)
-            for c in entre_v2.columns:
-                if c in ['SaldoCuotasInicial', 'AportesTipo1', 'SaldoCuotas', 'Patrimonio Afecto', 'Remuneración', 'Neto', 'Exento', 'IVA', 'TOTAL']:
-                    entre_v2.loc[j, c] = entre.loc[entre["id"] == x, c].sum()
-                else:
-                    entre_v2.loc[j, c] = entre.loc[entre["id"] == x, c].iloc[0]
-
-
-        # agregamos columnas de formato
+        entre_v2 = entre_v2[str_cols + num_cols]
         entre_v2["Remuneración Neta"] = entre_v2["Neto"] + entre_v2["Exento"]
-        entre_v2 = entre_v2.rename(columns = {"Neto":"Afecto"})
+        entre_v2 = entre_v2.rename(columns={"Neto": "Afecto"})
 
-        entre_v2.insert(0, "LLAVE", "")
-        entre_v2.insert(1, "RUNFONDO", "")
-        entre_v2.insert(2, "SERIEFONDO","")
+        # --- Columna 01-si-Cp (cartera propia) ---
+        entre_v2["01-si-Cp"] = entre_v2["Serie"].str.upper().str.contains("CP", na=False)
 
+        # --- Orden Interno ---
+        serie_u  = entre_v2["Serie"].str.upper().str.strip()
+        cod_u    = entre_v2["Cod.Realais"].str.upper().str.strip()
+        rut_s    = entre_v2["Rut Aportante"].astype(str).str.strip()
+        nom_u    = entre_v2["Nombre Fondo"].str.upper().fillna("")
+        tipo     = entre_v2["Tipo Series"]
 
-        ### diferencias ###
-        vali = pd.DataFrame(d_remu.groupby(["a_remu", "Fecha", "a_FS"])[["Remuneracion", "Patrimonio_Afecto"]].sum()).reset_index()
-        vali.columns = ["a_remu", "fecha", "serie", "remu_remu", "patri_remu"]
-        for i, x in enumerate(vali["a_remu"]):
-            vali.loc[i, "remu_entre"] = entre.loc[entre["a_remu"] == x, "Remuneración"].sum()
-            vali.loc[i, "patri_entre"] = entre.loc[entre["a_remu"] == x, "Patrimonio Afecto"].sum()
-            vali.loc[i, "dif_remu"] = vali.loc[i, "remu_remu"] - vali.loc[i, "remu_entre"]
-            vali.loc[i, "dif_patri"] = vali.loc[i, "patri_remu"] - vali.loc[i, "patri_entre"]
+        cond_404 = (
+            entre_v2["01-si-Cp"]                                                          # cartera propia (CP en serie)
+            | (serie_u.str.startswith("01-SI") & ~serie_u.str.contains("AFP", na=False)) # seguros de vida 01-si
+            | (rut_s == "87908100")                                                       # RUT 87908100
+            | (cod_u.isin(["F42","F45","F61","F65"]) & (tipo == "No APV"))               # fondos 42/45/61/65 seguros de vida
+            | nom_u.str.contains("SURA ASSET", na=False)                                 # Sura Asset completo
+            | serie_u.str.startswith("01-AFP")                                            # 01-AFP
+            | (cod_u == "F61")                                                            # F61 completo
+        )
+        cond_420 = ~cond_404 & (rut_s != "76011193")
+        cond_406 = ~cond_404 & (rut_s == "76011193") & (tipo == "APV")
+        cond_407 = ~cond_404 & (rut_s == "76011193") & (tipo == "No APV")
 
-        for x in vali.iloc[:,3:].columns.tolist():
-            vali.loc[:,x] = vali.loc[:,x].astype(float)
+        entre_v2["Orden Interno"] = np.select(
+            [cond_404, cond_420, cond_406, cond_407],
+            [404,       420,      406,      407],
+            default=0
+        )
 
-        ### tabla con informacion relevante ###
-        # tabla1 = remu.groupby(["a_Fondo", "a_FS"])["Remune"]
+        # --- Diferencias (vectorizado) ---
+        vali = d_remu.groupby(["a_remu","Fecha","a_FS"])[["Remuneracion","Patrimonio_Afecto"]].sum().reset_index()
+        vali.columns = ["a_remu","fecha","serie","remu_remu","patri_remu"]
+        remu_entre  = entre.groupby("a_remu")["Remuneración"].sum()
+        patri_entre = entre.groupby("a_remu")["Patrimonio Afecto"].sum()
+        vali["remu_entre"]  = vali["a_remu"].map(remu_entre).fillna(0.0)
+        vali["patri_entre"] = vali["a_remu"].map(patri_entre).fillna(0.0)
+        vali["dif_remu"]    = (vali["remu_remu"]  - vali["remu_entre"]).astype(float)
+        vali["dif_patri"]   = (vali["patri_remu"] - vali["patri_entre"]).astype(float)
+        for c in ["remu_remu","patri_remu","remu_entre","patri_entre"]:
+            vali[c] = vali[c].astype(float)
 
-        # ENTREGRA_FINAL Pasamos de formato Decimal a float
-        entre_final = entre_v2.copy()
-        for c in entre_final.columns:
-            if c in ["SaldoCuotasInicial", "AportesTipo1", "SaldoCuotas", "Remuneración", "Patrimonio Afecto", "Afecto", "Exento", "IVA", "TOTAL", "Remuneración Neta"]:
-                entre_final[c] = entre_final[c].astype(float)
-
-        # ENTREGA_BRUTA
-        for c in entre.columns:
-            if c in ["SaldoCuotasInicial", "AportesTipo1", "SaldoCuotas", "Remuneración", "Patrimonio Afecto", "Neto", "Exento", "IVA", "TOTAL"]:
-                entre[c] = entre[c].astype(float)
+        # --- Resumen por Orden Interno ---
+        resumen = (
+            entre_v2
+            .groupby("Orden Interno")[["Afecto","Exento","IVA","TOTAL","Remuneración Neta"]]
+            .sum()
+            .reset_index()
+        )
 
         ### EXPORTAMOS ###
         ruta = str(Path.home() / "Downloads") + "/Rebates1.xlsx"
         with pd.ExcelWriter(ruta) as w:
-            entre.iloc[:,0:21].to_excel(w, sheet_name="Plantilla", index = False)
-            entre_final.to_excel(w, sheet_name="Entregable", index = False)
-            vali.to_excel(w, sheet_name="Diferencias", index = False)
+            entre_v2.to_excel(w, sheet_name="Entregable",  index=False)
+            vali.to_excel(    w, sheet_name="Diferencias", index=False)
+            resumen.to_excel( w, sheet_name="Resumen",     index=False)
 
-        return entre_final
+        return entre_v2
 
 
 CARPETA = r"C:\Users\Administrador\Desktop\Rebates"
